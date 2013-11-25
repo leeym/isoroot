@@ -1,0 +1,766 @@
+#!/usr/local/bin/perl
+# leeym@leeym.com
+# Create FreeBSD chroot(8) environment from ISO-IMAGES
+use FindBin qw($Bin $Script);
+use Getopt::Long;
+use File::Basename;
+use Data::Dumper;
+use Config;
+use Config::IniFiles;
+use Sys::Hostname;
+use LWP::Simple;
+use Digest::MD5;
+use strict;
+
+my %opt;
+my $vnode  = '';
+my $done   = 0;
+my $myarch = $1 if $Config{myarchname} =~ m{^([^-]+)-};
+
+my $base = 'ftp://ftp.FreeBSD.org/pub/FreeBSD';
+
+#my @URL = ("$base/ISO-IMAGES-$myarch", "$base/releases/$myarch/ISO-IMAGES");
+my @URL = ("$base/ISO-IMAGES-$myarch");
+
+GetOptions \%opt, qw(
+  --verbose
+  --debug
+  --images
+  --list
+  --dump
+  --install
+  --deinstall
+  --create
+  --remove
+  --help
+  --mount
+  --umount
+  --set
+  --unset
+);
+
+my %PATH;
+$PATH{'HOME'} = "/usr/local/share/$Script";
+foreach my $d ('ROOT', 'IMAGE')
+{
+  $PATH{$d} = $PATH{'HOME'} . "/" . $d;
+  mkpath($PATH{$d});
+}
+
+my $whoami = (getpwuid($<))[0];
+
+die "$Script: You are not root!\n" if $<;
+
+my $ini_file = $PATH{'HOME'} . "/$Script.ini";
+if (!-f $ini_file)
+{
+  open(F, ">$ini_file") || die;
+  print F "[HOME]\n";
+  print F "createtime=" . time() . "\n";
+  close(F);
+  images();
+}
+tie(my %ini, 'Config::IniFiles', (-file => $ini_file))
+  || die @Config::IniFiles::errors;
+
+_set('HOME', undef, "BATCH=yes");
+_set('HOME', undef, "TRYBROKEN=yes");
+_set('HOME', undef, "FORCE_PACKAGE=yes");
+_set('HOME', undef, "USE_PACKAGE_DEPENDS=yes");
+_set('HOME', undef, "WRKDIRPREFIX=/usr/obj");
+_set('HOME', undef, "X11BASE=/usr/local");
+_set('HOME', undef, "WITH_CCACHE_BUILD=yes");
+_set('HOME', undef, "MAKE_JOBS_UNSAFE=yes");
+
+exit list(@ARGV)      if $opt{list};
+exit &dump(@ARGV)     if $opt{dump};
+exit images(@ARGV)    if $opt{images};
+exit install(@ARGV)   if $opt{install};
+exit deinstall(@ARGV) if $opt{deinstall};
+exit create(@ARGV)    if $opt{create};
+exit remove(@ARGV)    if $opt{remove};
+exit mount(@ARGV)     if $opt{mount};
+exit umount(@ARGV)    if $opt{umount};
+exit set(@ARGV)       if $opt{set};
+exit unset(@ARGV)     if $opt{unset};
+help()                if $opt{help};
+
+my $root = shift;
+exit execute($root, @ARGV) if $root;
+
+help();
+
+# END
+
+sub execute
+{
+  my $ret = _execute(1, @_);
+  return $ret ? $ret >> 8 : $ret;
+}
+
+sub _execute
+{
+  my $verbose = shift;
+  my $root    = shift;
+  my $cmd     = join(' ', @_);
+  help() if !$root;
+  my $shell = $ENV{'SHELL'};
+  my $_root = $PATH{'ROOT'} . '/' . $root;
+  $shell = '/bin/tcsh' if !-f "$_root/bin/$shell";
+  my $realcmd = $cmd ? "$shell -c '$cmd'" : $shell;
+  die "$Script: ROOT:$root not found" if !-d $_root;
+  mount($root);
+  my $env = $ini{"ROOT:$root"}{'ENV'};
+
+  foreach my $envk (sort keys %ENV)
+  {
+    $env .= sprintf(" %s=\"%s\"", $envk, $ENV{$envk});
+  }
+  print "\nEntering: isoroot $root $cmd\n\n" if $verbose;
+  my $ret = System("/usr/sbin/chroot $_root $realcmd", $env);
+  printf("\nReturning(%d): isoroot $root $cmd\n\n", $ret) if $verbose;
+  return $ret;
+}
+
+sub System
+{
+  my $cmd = shift;
+  my $env = shift;
+  warn "- $cmd\n"  if $cmd !~ m{^/};
+  print "+ $cmd\n" if $opt{verbose};
+  my $rv = system("/usr/bin/env $env $cmd");
+  die "$Script: $cmd: failed: $rv: $!" if $rv != 0;
+  return 0;
+}
+
+sub create
+{
+  my $root  = shift;
+  my $image = shift;
+  help() if !$root;
+  print "$Script: Creating ROOT:$root from IMAGE:$image\n" if !$opt{quiet};
+  my $_root = $PATH{'ROOT'} . '/' . $root;
+  die "$Script: ROOT:$root exists already\n" if mountpoint($_root);
+  chomp($image = `/usr/bin/uname -r`) if !$image;
+  my $_image = $PATH{'IMAGE'} . '/' . $image;
+  install($image) if !-d $_image;
+  mkpath($_root);
+
+  System("/sbin/mount -t unionfs -o noatime,below $_image $_root");
+
+  chmod(0777, "$_root/tmp", "$_root/var/tmp", "$_root/var/tmp/vi.recover");
+
+  my $packages = '/usr/ports/packages-' . $1 if $image =~ m{^(\d+)};
+  for my $d ('/home', '/usr/ports', $packages)
+  {
+    mkpath($d);
+    mkpath($_root . $d);
+  }
+
+  for my $f (
+    glob("/etc/*passwd /etc/group /etc/localtime /etc/resolv.conf /etc/ssh/*"))
+  {
+    rm($_root . $f);
+    cp($f, $_root . $f);
+    my $mode = (stat($f))[2];
+    chmod($mode & 07777, $_root . $f);
+  }
+  _execute(0, $root, '/usr/sbin/pwd_mkdb /etc/master.passwd');
+  _execute(0, $root, '/sbin/ldconfig -elf /usr/lib /usr/lib/compat');
+  _execute(0, $root, '/sbin/ldconfig -aout /usr/lib/aout /usr/lib/compat/aout');
+
+  $ini{'ROOT'}{$root}         = $_root;
+  $ini{"ROOT:$root"}{'ctime'} = time();
+  $ini{"ROOT:$root"}{'image'} = $image;
+  $ini{"ROOT:$root"}{'owner'} = $ENV{SUDO_USER} || $ENV{LOGNAME} || $whoami;
+
+  # FS
+  my $memfs = 'mfs:md';
+  $memfs = 'tmpfs:tmpfs' if -e '/boot/kernel/tmpfs.ko';
+  my @FS;
+  push(@FS, 'devfs:/dev');
+  push(@FS, 'procfs:/proc');
+  push(@FS, 'nullfs:/usr/ports');
+  push(@FS, 'nullfs:/home');
+  push(@FS, "$memfs:/tmp");
+  push(@FS, "$memfs:/usr/obj");
+  push(@FS, "$memfs:/var/tmp");
+  push(@FS, "$memfs:/var/db/pkg");
+  push(@FS, "$memfs:/usr/local");
+  $ini{"ROOT:$root"}{'fstab'} = join(' ', @FS);
+  mount($root);
+
+  # ENV
+  set($root, "ISOROOT_NAME=$root");
+  set($root, "PACKAGES=$packages");
+  uname($_root, $image);
+
+  return 0;
+}
+
+sub set
+{
+  _set('ROOT', @_);
+}
+
+sub _set
+{
+  my $prefix = shift;
+  my $name   = shift;
+  my @pairs  = @_;
+  my $_name  = ($prefix && $name) ? "$prefix:$name" : "$prefix$name";
+  my %_ENV   = getHash($ini{"$_name"}{'ENV'});
+  my $image  = $ini{"$prefix:$name"}{'image'};
+  foreach my $pair (split(' ', $ini{'HOME'}{'ENV'}),
+    @pairs, split(' ', $ini{"IMAGE:$image"}{'ENV'}))
+  {
+    my ($k, $v) = ($1, $2) if $pair =~ /^([^=]+)=(.+)$/;
+    die "$Script: $pair isn't key=value" if !length($k) || !length($v);
+    $_ENV{$k} = $v;
+  }
+  $ini{"$_name"}{'ENV'} = setHash(%_ENV);
+  print map { "$_=$_ENV{$_}\n" } keys %_ENV unless scalar(@pairs);
+}
+
+sub unset
+{
+  _unset('ROOT', @_);
+}
+
+sub _unset
+{
+  my $prefix = shift;
+  my $name   = shift;
+  die "$Script: $prefix:$name not found" if !exists($ini{"$prefix:$name"});
+  my @K = @_;
+  return if !scalar(@K);
+  my %_ENV = getHash($ini{"$prefix:$name"}{'ENV'});
+  map { delete($_ENV{$_}) } @K;
+  my $image = $ini{"$prefix:$name"}{'image'};
+  $ini{"$prefix:$name"}{'ENV'} = setHash(%_ENV);
+}
+
+sub fstab
+{
+  my $root   = shift;
+  my $action = shift;
+  die "$Script: unknown action: $action" if $action !~ /^u?mount$/;
+  my @FS = split(' ', $ini{"ROOT:$root"}{'fstab'});
+  my $_root = $PATH{'ROOT'} . '/' . $root;
+  die "$Script: ROOT:$root not found" if !-d $_root;
+  my %MOUNT;
+  open(M, "/sbin/mount |") || die $!;
+
+  while (<M>)
+  {
+    my ($src, $dst, $type) = ($1, $2, $3) if m{^(\S+) on (\S+) \((\w+),?.*?\)};
+    $MOUNT{$dst} = "$type:$src:$dst";
+  }
+  close(M);
+  foreach my $fs (@FS)
+  {
+    my ($type, $src, $dst, $o) = split(':', $fs);
+    $dst = $src if !$dst;
+    mkpath("$_root$dst", $opt{verbose}) if !-d "$_root$dst";
+    my $cmd;
+    if ($action eq 'mount')
+    {
+      next if exists($MOUNT{"$_root$dst"});
+      $cmd = "/sbin/$action -t ${type} $src $_root$dst";
+      $cmd = "/sbin/mdmfs -s 2G $src $_root$dst" if $type eq 'mfs';
+    }
+    elsif ($action eq 'umount')
+    {
+      next if !exists($MOUNT{"$_root$dst"});
+      my $_src = (split(':', $MOUNT{"$_root$dst"}))[1];
+      $cmd = "/sbin/$action -f $_root$dst";
+      $cmd .= " && /sbin/mdconfig -d -u $_src" if $type eq 'mfs';
+    }
+    System($cmd);
+  }
+}
+
+sub mount
+{
+  fstab(shift, 'mount');
+}
+
+sub umount
+{
+  fstab(shift, 'umount');
+}
+
+sub download
+{
+  my $image = shift;
+  my $ver   = $1 if $image =~ m{^([^-]+)-};
+  my $file  = "FreeBSD-$image-$myarch-memstick.img";
+  my $path  = "$PATH{IMAGE}/$file";
+  if (-f $path)
+  {
+    images() if !$ini{MD5}{$file};
+    return $path if md5_file($path) eq $ini{MD5}{$file};
+    System("/bin/rm -f $path");
+  }
+  print "$Script: Downloading IMAGE:$image\n" if !$opt{quiet};
+  foreach my $url (@URL)
+  {
+    my $status = MIRROR("$url/$ver/$file", $path);
+    return $path if $status == 200;
+  }
+  die "$Script: can't download $file\n";
+}
+
+sub install
+{
+  my $image = shift;
+  help() if !$image;
+  print "$Script: Installing IMAGE:$image\n" if !$opt{quiet};
+  my $_image = $PATH{'IMAGE'} . '/' . $image;
+  die "$Script: IMAGE:$image exists already\n" if mountpoint($_image);
+  my $file = download($image);
+  die "$Script: not a valid image: $image" if !$file;
+  mkpath($_image);
+
+  $vnode = 'md' . vnode();
+  System("/sbin/mdconfig -a -t vnode -f $file -u $vnode");
+  $ini{'IMAGE'}{$image} = $_image;
+
+  # read-only
+  System("/sbin/mount -r /dev/$vnode $_image");
+  my %K = parse_kernel($_image);
+  _set('IMAGE', $image, "OSVERSION=" . OSVERSION($_image));
+  _set('IMAGE', $image, "OSREL=" . $K{osrel});
+  foreach my $k (keys %K)
+  {
+    $ini{"IMAGE:$image"}{$k} = $K{$k};
+  }
+  $done = 1;
+  return 0;
+}
+
+sub GREP
+{
+  my $file    = shift;
+  my $pattern = shift;
+  open(F, $file) || return;
+  my $str;
+  while (<F>)
+  {
+    $str = $1 if /$pattern/;
+    last if $str;
+  }
+  close(F);
+  die "$Script: $pattern not found in $file" if !$str;
+  return $str;
+}
+
+sub OSVERSION
+{
+  my $_root = shift;
+  GREP("$_root/usr/include/sys/param.h", '^#define __FreeBSD_version (\d+)');
+}
+
+sub mtree
+{
+  my $file = shift;
+  open(F, $file) || return;
+  my @DIRS;
+  while (<F>)
+  {
+    chomp(my $line = $_);
+    next if $line =~ /^#/;
+    $line =~ s/^\s{4}//g;
+    next if $line !~ /^\w/;
+    $line =~ s/\s.*//g;
+    push(@DIRS, $line);
+  }
+  close(F);
+  return join(' ', @DIRS);
+}
+
+sub deinstall
+{
+  my $image  = shift;
+  my $_image = $PATH{'IMAGE'} . '/' . $image;
+  print "$Script: Deinstalling IMAGE:$image at $_image\n" if !$opt{quiet};
+  $vnode = mountpoint($_image);
+  die "$Script: can't find mountpoint for $_image\n" if !$vnode;
+  System("/sbin/umount $_image");
+  System("/sbin/mdconfig -d -u $vnode");
+  rmtree($_image, $opt{verbose});
+  $ini{"IMAGE:$image"} = {};
+  delete($ini{"IMAGE:$image"});
+  delete($ini{'IMAGE'}{$image});
+}
+
+sub remove
+{
+  my $root = shift;
+  help() if !$root;
+  my $_root = $PATH{'ROOT'} . '/' . $root;
+  die "$Script: ROOT:$root not found" if !-d $_root;
+  umount($root);
+  print "$Script: Removing ROOT:$root\n" if !$opt{quiet};
+  System("/sbin/umount $_root");
+  rmtree($_root);
+  $ini{"ROOT:$root"} = {};
+  delete($ini{"ROOT:$root"});
+  delete($ini{'ROOT'}{$root});
+}
+
+sub help
+{
+  die <<END;
+Usage:
+	$Script [options(s)] [command [argument(s)]]
+
+Options:
+	--verbose
+	--debug
+
+Commands:
+	--help
+	--list
+	--create <root> <image>
+	--remove <root>
+	--set <root> <key1>=<value1> [<key2>=<value2> ...]
+	--unset <root> <key1> [<key2> ...]
+	<root> <command> [<arguments> ...]
+
+END
+}
+
+sub list
+{
+  my $sec = shift;
+  map { delete($ini{$_}) if !scalar(keys %{ $ini{$_} }); } (keys %ini);
+  foreach my $type ('IMAGE', 'ROOT')
+  {
+    opendir(D, $PATH{$type}) || die $!;
+    foreach my $l (grep { !/^\./ && -d $PATH{$type} . "/" . $_; } readdir(D))
+    {
+      $ini{$type}{$l} = $PATH{$type} . "/$l";
+    }
+    closedir(D);
+  }
+  foreach my $root (keys %{ $ini{ROOT} })
+  {
+    my $path = $ini{ROOT}{$root};
+    if (!-d $path)
+    {
+      delete($ini{ROOT}{$root});
+      next;
+    }
+    my $ctime = $ini{"ROOT:$root"}{ctime};
+    my $image = $ini{"ROOT:$root"}{image};
+    my $owner = $ini{"ROOT:$root"}{owner};
+    print "$root ($image, $ctime, $owner)\n";
+  }
+  return 0;
+}
+
+sub file2image
+{
+  my $_image = shift;
+  $_image =~ s{.*/}{}ig;
+  $_image =~ s{^FreeBSD-}{}ig;
+  $_image =~ s{-\w+-(disc\d+|livefs)\.iso$}{}ig;
+  $_image =~ s{-\w+-memstick\.img$}{}ig;
+  my ($uname, $arch) = ($1, $2) if $_image =~ /(.+)-?([a-z\d]+)?/;
+  return if ($arch && $arch ne $myarch);
+  return $uname;
+}
+
+sub getHash
+{
+  splitHash('=', ' ', @_);
+}
+
+sub setHash
+{
+  joinHash('=', ' ', @_);
+}
+
+sub splitHash
+{
+  my $sep1 = shift;
+  my $sep2 = shift;
+  my $str  = shift;
+  my %hash;
+  foreach my $pair (split($sep2, $str))
+  {
+    my ($k, $v) = split($sep1, $pair);
+    next if !length($v);
+    $hash{$k} = $v;
+  }
+  return %hash;
+}
+
+sub joinHash
+{
+  my $sep1 = shift;
+  my $sep2 = shift;
+  my %hash = @_;
+  my $str;
+  foreach my $k (sort keys %hash)
+  {
+    $str .= $sep2 if $str;
+    $str .= "$k$sep1$hash{$k}";
+  }
+  return $str;
+}
+
+sub dump
+{
+  print Dumper(\%ini);
+  return 0;
+}
+
+sub images
+{
+  print "Updating MD5 for image files\n" if $opt{verbose};
+  my %F;
+  foreach my $url (@URL)
+  {
+    foreach my $line (split("\n", GET("$url/")))
+    {
+      next if $line !~ m{^d};
+      my @F = split(/\s+/, $line);
+      my $ver = pop(@F);
+      foreach my $line2 (split("\n", GET("$url/$ver/")))
+      {
+        my @G = split(/\s+/, $line2);
+        my $file = pop(@G);
+        next if $file !~ m{\.img$};
+        $F{$file} = "$url/$ver";
+      }
+    }
+  }
+  my @I;
+  foreach my $f (keys %F)
+  {
+    my $url = $F{$f};
+    my $i   = file2image($f);
+    CHECKSUM("$url/CHECKSUM.MD5") if !exists($ini{MD5}{$f});
+
+    #CHECKSUM("$url/CHECKSUM.SHA256") if !exists($ini{SHA256}{$f});
+    push(@I, $i);
+  }
+  foreach my $i (sort { $b <=> $a } @I)
+  {
+    printf("%s%s\n", $i, (-d "$PATH{IMAGE}/$i" ? ' (installed)' : ''));
+  }
+  return 0;
+}
+
+sub vnode
+{
+  opendir(DIR, '/dev') || die "can't opendir /dev: $!";
+  my %vnode;
+  map { $vnode{$_} = $_; } grep { /^(md|vn)\d+/ } readdir(DIR);
+  closedir DIR;
+  for (my $i = 0; $i < 1024; $i++)
+  {
+    return $i if (!exists($vnode{"md$i"}) && !exists($vnode{"vn$i"}));
+  }
+  die "No vnode available";
+}
+
+sub kernel
+{
+  my $path = shift;
+  foreach my $file (qw(/boot/kernel/kernel /boot/GENERIC/kernel))
+  {
+    return "$path$file" if -f "$path$file";
+  }
+  die "kernel not found";
+}
+
+sub parse_kernel
+{
+  my $path   = shift;
+  my $kernel = kernel($path);
+  my $str    = `strings $kernel`;
+  my %K;
+
+  $K{build_time} = $1 if $str =~ m{(\w+ \w+\s+\d+ \d\d:\d\d:\d\d \w+ \d\d\d\d)};
+  $K{build_dir}  = $1 if $str =~ m{(\S+\@\S+:/\S+)};
+  $K{identity}   = $1 if $str =~ m{\S+\@\S+:/\S+/(.+)};
+  $K{machine}    = $1 if $str =~ m{(\w+)_extend_pcb}m;
+  $K{osrel}      = $1 if $str =~ m{(\d+(?:\.\d+)+)-[A-Z]+};
+  $K{release}    = $1 if $str =~ m{(\d+(?:\.\d+)+-[A-Z]+)};
+  $K{os}         = $1 if $str =~ m{(\w+) \d+(?:\.\d+)+-[A-Z]+}m;
+  print Dumper(\%K) if $opt{debug};
+
+=leeym
+$VAR1 = {
+          'build_time' => 'Fri Sep 27 03:52:52 UTC 2013',
+          'build_dir' => 'root@bake.isc.freebsd.org:/usr/obj/usr/src/sys/GENERIC',
+          'identity' => 'GENERIC',
+          'osrel' => '9.2',
+          'release' => '9.2-RELEASE',
+          'machine' => 'i386',
+          'os' => 'FreeBSD'
+        };
+=cut
+
+  return %K;
+}
+
+sub uname
+{
+  my $_root = shift;
+  my $image = shift;
+  my $file  = "$_root/usr/bin/uname";
+  print "Updating $file\n" if $opt{verbose};
+  my $identity   = $ini{"IMAGE:$image"}{identity}   || die $!;
+  my $machine    = $ini{"IMAGE:$image"}{machine}    || die $!;
+  my $release    = $ini{"IMAGE:$image"}{release}    || die $!;
+  my $os         = $ini{"IMAGE:$image"}{os}         || die $!;
+  my $build_time = $ini{"IMAGE:$image"}{build_time} || die $!;
+  my $build_dir  = $ini{"IMAGE:$image"}{build_dir}  || die $!;
+  my $hostname   = hostname()                       || die $!;
+
+  open(F, ">$file") || die "$Script: can't write $file: $!";
+  print F <<END;
+#!/bin/sh
+args=`getopt aimnprsv \$*`
+if [ \$? -ne 0 ]; then
+  echo usage: uname [-aimnprsv]
+  exit 2
+fi
+set -- \$args
+out=""
+for x
+do
+  case "\$x"
+  in
+    -a)
+      out="$os $hostname $release $os $release #0: $build_time     $build_dir  $machine"
+      break;
+      shift;;
+    -s)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$os"
+      shift;;
+    -n)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$hostname"
+      shift;;
+    -r)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$release"
+      shift;;
+    -v)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$os $release #0: $build_time     $build_dir"
+      shift;;
+    -m)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$machine"
+      shift;;
+    -p)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$machine"
+      shift;;
+    -i)
+      if [ ! -z "\$out" ]; then out="\${out} "; fi; out="\${out}$identity"
+      shift;;
+  esac
+done
+if [ -z "\$out" ]; then out="$os"; fi
+echo "\$out"
+END
+  close(F);
+  chmod(0755, $file);
+}
+
+END
+{
+  my $rc = $?;
+  System("/sbin/mdconfig -d -u $vnode") if (!$done && $vnode ne '');
+  print "WriteConfig($ini_file)\n" if $opt{debug};
+  map { delete($ini{$_}) if !scalar(%{ $ini{$_} }) } keys %ini;
+
+  #print Dumper(\%ini) if $opt{debug};
+  tied(%ini)->WriteConfig($ini_file) if %ini;
+  exit $rc;
+}
+
+sub GET
+{
+  my $url = shift;
+  print "GET $url\n" if $opt{verbose};
+  return get($url);
+}
+
+sub MIRROR
+{
+  my $url  = shift;
+  my $file = shift;
+  print "MIRROR $url to $file\n" if $opt{verbose};
+  return mirror($url, $file);
+}
+
+sub mkpath
+{
+  my $path = shift;
+  return if -d $path;
+  return System("/bin/mkdir -p $path");
+}
+
+sub rmtree
+{
+  my $path = shift;
+  return System("/bin/rm -fr $path");
+}
+
+sub CHECKSUM
+{
+  my $url = shift;
+  foreach my $l (split("\n", GET($url)))
+  {
+    my ($t, $f, $s) = ($1, $2, $3) if $l =~ m{^(\S+) \((\S+)\) = (\S+)$};
+    next if $f !~ m{\.img$};
+    print "- $t ($f) = $s\n" if $opt{debug};
+    $ini{$t}{$f} = $s;
+  }
+}
+
+sub md5_file
+{
+  my $file = shift;
+  print "$Script: Checking MD5 for $file\n" if $opt{verbose};
+  open(FILE, $file) or die "Can't open '$file': $!";
+  binmode(FILE);
+  my $md5 = Digest::MD5->new;
+  while (<FILE>)
+  {
+    $md5->add($_);
+  }
+  close(FILE);
+  my $str = $md5->hexdigest;
+  print "- MD5 ($file) = $str\n" if $opt{debug};
+  return $str;
+}
+
+sub rm
+{
+  my $path = shift;
+  return System("/bin/rm -f $path");
+}
+
+sub cp
+{
+  my $src = shift;
+  my $dst = shift;
+  return System("/bin/cp $src $dst");
+}
+
+sub mountpoint
+{
+  my $path = shift;
+  open(M, "/sbin/mount |") || die $!;
+  while (<M>)
+  {
+    my ($src, $dst, $type) = ($1, $2, $3) if m{^(\S+) on (\S+) \((\w+),?.*?\)};
+    return $src if $dst eq $path;
+  }
+  close(M);
+  return 0;
+}
