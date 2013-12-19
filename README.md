@@ -5,27 +5,28 @@ Create FreeBSD chroot(8) environment from ISO-IMAGES
 
 <pre>
 Usage:
-	isoroot [options(s)] [command [argument(s)]]
+	isoroot [options(s)] [action [argument(s)]]
 
 Options:
 	--verbose
 	--debug
 
-Common commands:
+Common actions:
 	--help
 	--list
 	--images
-	--create <root> <image>
-	--remove <root>
-	<root> <command> [<arguments> ...]
+	--create ROOT IMAGE
+	--remove ROOT
+	ROOT command [arguments ...]
 
-Advanced commands:
+Advanced actions:
 	--dump
-	--install <image>
-	--deinstall <image>
-	--mount <root>
-	--umount <root>
-	--set <root> <key1>=<value1> [<key2>=<value2> ...]
-	--unset <root> <key1> [<key2> ...]
+	--install IMAGE
+	--deinstall IMAGE
+	--mount ROOT
+	--umount ROOT
+	--set ROOT KEY1=VALUE1 [KEY2=VALUE2 ...]
+	--unset ROOT KEY1 [KEY2 ...]
 
 </pre>
+
