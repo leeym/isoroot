@@ -244,6 +244,7 @@ sub fstab
 {
   my $root   = shift;
   my $action = shift;
+  die "$Script: unknown ROOT" if !$root;
   die "$Script: unknown action: $action" if $action !~ /^u?mount$/;
   my @FS = split(' ', $ini{"ROOT:$root"}{'fstab'});
   my $_root = $PATH{'ROOT'} . '/' . $root;
@@ -282,12 +283,14 @@ sub fstab
 
 sub mount
 {
-  fstab(shift, 'mount');
+  my $root = shift;
+  fstab($root, 'mount');
 }
 
 sub umount
 {
-  fstab(shift, 'umount');
+  my $root = shift;
+  fstab($root, 'umount');
 }
 
 sub download
@@ -419,14 +422,22 @@ Options:
 	--verbose
 	--debug
 
-Commands:
+Common commands:
 	--help
 	--list
+	--images
 	--create <root> <image>
 	--remove <root>
+	<root> <command> [<arguments> ...]
+
+Advanced commands:
+	--dump
+	--install <image>
+	--deinstall <image>
+	--mount <root>
+	--umount <root>
 	--set <root> <key1>=<value1> [<key2>=<value2> ...]
 	--unset <root> <key1> [<key2> ...]
-	<root> <command> [<arguments> ...]
 
 END
 }
@@ -520,6 +531,15 @@ sub dump
 sub images
 {
   print "Updating MD5 for image files\n" if $opt{verbose};
+  my %I;
+  opendir(D, $PATH{'IMAGE'}) || die $!;
+  foreach my $i (grep { !/^\./ && -d $PATH{'IMAGE'} . "/" . $_; } readdir(D))
+  {
+    $I{$i}{'installed'}++;
+    $I{$i}{'obsoleted'}++;
+  }
+  closedir(D);
+
   my %F;
   foreach my $url (@URL)
   {
@@ -537,7 +557,7 @@ sub images
       }
     }
   }
-  my @I;
+
   foreach my $f (keys %F)
   {
     my $url = $F{$f};
@@ -545,11 +565,13 @@ sub images
     CHECKSUM("$url/CHECKSUM.MD5") if !exists($ini{MD5}{$f});
 
     #CHECKSUM("$url/CHECKSUM.SHA256") if !exists($ini{SHA256}{$f});
-    push(@I, $i);
+    delete($I{$i}{'obsoleted'});
   }
-  foreach my $i (sort { $b <=> $a } @I)
+
+  foreach my $i (sort { $b <=> $a } keys %I)
   {
-    printf("%s%s\n", $i, (-d "$PATH{IMAGE}/$i" ? ' (installed)' : ''));
+    my $t = join(', ', keys %{ $I{$i} });
+    printf("$i%s\n", $t ? " ($t)" : "");
   }
   return 0;
 }
