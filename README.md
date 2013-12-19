@@ -3,6 +3,7 @@ isoroot
 
 Create FreeBSD chroot(8) environment from ISO-IMAGES
 
+<pre>
 Usage:
 	isoroot [options(s)] [command [argument(s)]]
 
@@ -27,3 +28,4 @@ Advanced commands:
 	--set <root> <key1>=<value1> [<key2>=<value2> ...]
 	--unset <root> <key1> [<key2> ...]
 
+</pre>
