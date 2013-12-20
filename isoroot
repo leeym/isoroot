@@ -14,7 +14,6 @@ use strict;
 
 my %opt;
 my $vnode  = '';
-my $done   = 0;
 my $myarch = $1 if $Config{myarchname} =~ m{^([^-]+)-};
 
 my $base = 'ftp://ftp.FreeBSD.org/pub/FreeBSD';
@@ -338,7 +337,7 @@ sub install
   {
     $ini{"IMAGE:$image"}{$k} = $K{$k};
   }
-  $done = 1;
+  $vnode = '';
   return 0;
 }
 
@@ -395,6 +394,7 @@ sub deinstall
   $ini{"IMAGE:$image"} = {};
   delete($ini{"IMAGE:$image"});
   delete($ini{'IMAGE'}{$image});
+  $vnode = '';
 }
 
 sub remove
@@ -695,7 +695,7 @@ END
 END
 {
   my $rc = $?;
-  System("/sbin/mdconfig -d -u $vnode") if (!$done && $vnode ne '');
+  System("/sbin/mdconfig -d -u $vnode") if $vnode;
   print "WriteConfig($ini_file)\n" if $opt{debug};
   map { delete($ini{$_}) if !scalar(%{ $ini{$_} }) } keys %ini;
 
